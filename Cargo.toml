@@ -1,0 +1,28 @@
+[package]
+name = "brc"
+version = "0.1.0"
+edition = "2024"
+
+[features]
+profiled = ["dep:pprof"]
+
+[dependencies]
+clap = { version = "4.5.53", features = ["derive"] }
+itertools = "0.14.0"
+memmap2 = "0.9.9"
+pprof = { version = "0.15.0", features = ["flamegraph"], optional = true }
+
+[profile.profiled]
+inherits = "release"
+opt-level = 3
+debug = true
+strip = "none"
+lto = "off"
+incremental = false
+
+[profile.release]
+debug-assertions = false
+overflow-checks = false
+codegen-units = 1
+lto = "fat"
+panic = "abort"
