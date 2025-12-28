@@ -5,3 +5,4 @@ target
 *.swp
 *.txt
 perf.data*
+diff.py
