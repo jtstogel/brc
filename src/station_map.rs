@@ -20,7 +20,7 @@ impl StationNameKeyView {
         unsafe { &*(s as *const str as *const StationNameKeyView) }
     }
 
-    fn hash_u64(&self) -> u64 {
+    pub fn hash_u64(&self) -> u64 {
         hash64(self.name.as_bytes())
     }
 }
@@ -61,9 +61,6 @@ impl Borrow<StationNameKeyView> for StationNameKey {
 
 impl PartialEq for StationNameKeyView {
     fn eq(&self, other: &Self) -> bool {
-        // This saves about two seconds compared to standard string comparisons.
-        // My guess is that there are so few collisions, we're almost always looking
-        // at the entire string anyway.
         unsafe { memeq64_unchecked(self.name.as_bytes(), other.name.as_bytes()) }
     }
 }
@@ -108,6 +105,10 @@ impl StationNameKey {
         StationNameKey {
             name: InlineString::new(name),
         }
+    }
+
+    pub fn view(&self) -> &StationNameKeyView {
+        self.borrow()
     }
 }
 
@@ -161,7 +162,7 @@ impl BuildHasher for NopHasherBuilder {
     }
 }
 
-pub type StationMap<V> = std::collections::HashMap<StationNameKey, V, NopHasherBuilder>;
+pub type StationMap<V> = hashbrown::HashMap<StationNameKey, V, NopHasherBuilder>;
 
 pub fn new_station_map<V>(capacity: usize) -> StationMap<V> {
     StationMap::<V>::with_capacity_and_hasher(capacity, NopHasherBuilder::default())
