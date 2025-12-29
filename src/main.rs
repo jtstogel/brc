@@ -1,6 +1,7 @@
 #![feature(hint_prefetch)]
 
 use brc::memops::memchr64_unchecked;
+use brc::station_map::StationMap;
 use brc::station_map::StationNameKey;
 use brc::station_map::StationNameKeyView;
 use brc::station_map::new_station_map;
@@ -145,6 +146,15 @@ where
     Ok(())
 }
 
+// This is rarely called (10k times out of 1B rows),
+// so make sure it's outlined from the hot path.
+#[inline(never)]
+fn insert_temperature(m: &mut StationMap<TemperatureSummary>, k: &str, temp: i32) {
+    m.entry(StationNameKey::new(k))
+        .or_default()
+        .add_reading(temp)
+}
+
 #[cfg_attr(feature = "profiled", inline(never))]
 pub fn temperature_reading_summaries(
     input_path: &str,
@@ -212,29 +222,19 @@ pub fn temperature_reading_summaries(
                 e.1.add_reading(temperature3);
             }
 
-            if !e0_found || !e1_found || !e2_found || !e3_found {
-                temperatures.insert(
-                    StationNameKey::new(station0),
-                    TemperatureSummary::of(temperature0),
-                );
+            // Have to redo all the lookups in case we happen to see the same
+            // station in the batch of four rows.
+            if !e0_found {
+                insert_temperature(&mut temperatures, station0, temperature0);
             }
             if !e1_found {
-                temperatures.insert(
-                    StationNameKey::new(station1),
-                    TemperatureSummary::of(temperature1),
-                );
+                insert_temperature(&mut temperatures, station1, temperature1);
             }
             if !e2_found {
-                temperatures.insert(
-                    StationNameKey::new(station2),
-                    TemperatureSummary::of(temperature2),
-                );
+                insert_temperature(&mut temperatures, station2, temperature2);
             }
             if !e3_found {
-                temperatures.insert(
-                    StationNameKey::new(station3),
-                    TemperatureSummary::of(temperature3),
-                );
+                insert_temperature(&mut temperatures, station3, temperature3);
             }
 
             IterationControl::Continue

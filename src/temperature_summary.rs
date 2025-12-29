@@ -16,8 +16,9 @@ impl TemperatureSummary {
         self.max.get()
     }
 
-    pub fn avg(&self) -> f32 {
-        ((self.total.get() as f64 / self.count.get() as f64) / 10f64) as f32
+    pub fn avg(&self) -> f64 {
+        let rounded_total = self.total.get() + (self.count.get() / 2) as i64;
+        rounded_total.div_euclid(self.count.get() as i64) as f64 / 10.0
     }
 
     #[cfg_attr(feature = "profiled", inline(never))]
