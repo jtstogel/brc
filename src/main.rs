@@ -164,77 +164,53 @@ pub fn temperature_reading_summaries(
 
     let mut temperatures = new_station_map::<TemperatureSummary>(12_500);
 
-    batched_process_lines::<4, _>(file, |lines: &[&[u8]]| {
-        if lines.len() == 4 {
-            let l0 = lines[0];
-            let l1 = lines[1];
-            let l2 = lines[2];
-            let l3 = lines[3];
-
-            let delim_idx0 = unsafe { memchr64_unchecked::<b';'>(l0) };
-            let delim_idx1 = unsafe { memchr64_unchecked::<b';'>(l1) };
-            let delim_idx2 = unsafe { memchr64_unchecked::<b';'>(l2) };
-            let delim_idx3 = unsafe { memchr64_unchecked::<b';'>(l3) };
-
-            let temperature0 = parse_temperature(l0);
-            let temperature1 = parse_temperature(l1);
-            let temperature2 = parse_temperature(l2);
-            let temperature3 = parse_temperature(l3);
-
-            let station0 = unsafe { std::str::from_utf8_unchecked(l0.get_unchecked(..delim_idx0)) };
-            let station1 = unsafe { std::str::from_utf8_unchecked(l1.get_unchecked(..delim_idx1)) };
-            let station2 = unsafe { std::str::from_utf8_unchecked(l2.get_unchecked(..delim_idx2)) };
-            let station3 = unsafe { std::str::from_utf8_unchecked(l3.get_unchecked(..delim_idx3)) };
-
-            let hash0 = StationNameKeyView::new(station0).hash_u64();
-            let hash1 = StationNameKeyView::new(station1).hash_u64();
-            let hash2 = StationNameKeyView::new(station2).hash_u64();
-            let hash3 = StationNameKeyView::new(station3).hash_u64();
-
-            let e0 = temperatures
-                .raw_entry()
-                .from_hash(hash0, |k| k.view() == StationNameKeyView::new(station0));
-            let e1 = temperatures
-                .raw_entry()
-                .from_hash(hash1, |k| k.view() == StationNameKeyView::new(station1));
-            let e2 = temperatures
-                .raw_entry()
-                .from_hash(hash2, |k| k.view() == StationNameKeyView::new(station2));
-            let e3 = temperatures
-                .raw_entry()
-                .from_hash(hash3, |k| k.view() == StationNameKeyView::new(station3));
-
-            let e0_found = e0.is_some();
-            let e1_found = e1.is_some();
-            let e2_found = e2.is_some();
-            let e3_found = e3.is_some();
-
-            if let Some(e) = e0 {
-                e.1.add_reading(temperature0);
-            }
-            if let Some(e) = e1 {
-                e.1.add_reading(temperature1);
-            }
-            if let Some(e) = e2 {
-                e.1.add_reading(temperature2);
-            }
-            if let Some(e) = e3 {
-                e.1.add_reading(temperature3);
+    const N: usize = 4;
+    batched_process_lines::<N, _>(file, |lines: &[&[u8]]| {
+        if lines.len() == N {
+            let mut delim_indexes = [0usize; N];
+            for i in 0..N {
+                delim_indexes[i] = unsafe { memchr64_unchecked::<b';'>(lines[i]) };
             }
 
-            // Have to redo all the lookups in case we happen to see the same
-            // station in the batch of four rows.
-            if !e0_found {
-                insert_temperature(&mut temperatures, station0, temperature0);
+            let mut station_temperatures = [0i32; N];
+            for i in 0..N {
+                station_temperatures[i] = parse_temperature(lines[i]);
             }
-            if !e1_found {
-                insert_temperature(&mut temperatures, station1, temperature1);
+
+            let mut stations = [""; N];
+            for i in 0..N {
+                stations[i] = unsafe {
+                    std::str::from_utf8_unchecked(lines[i].get_unchecked(..delim_indexes[i]))
+                };
             }
-            if !e2_found {
-                insert_temperature(&mut temperatures, station2, temperature2);
+
+            let mut hashes = [0u64; N];
+            for i in 0..N {
+                hashes[i] = StationNameKeyView::new(stations[i]).hash_u64();
             }
-            if !e3_found {
-                insert_temperature(&mut temperatures, station3, temperature3);
+
+            let mut entries: [Option<(&StationNameKey, &TemperatureSummary)>; N] = [None; N];
+            for i in 0..N {
+                entries[i] = temperatures.raw_entry().from_hash(hashes[i], |k| {
+                    k.view() == StationNameKeyView::new(stations[i])
+                });
+            }
+
+            let mut found = [false; N];
+            for i in 0..N {
+                found[i] = entries[i].is_some();
+            }
+
+            for i in 0..N {
+                if let Some(e) = entries[i] {
+                    e.1.add_reading(station_temperatures[i]);
+                }
+            }
+
+            for i in 0..N {
+                if !found[i] {
+                    insert_temperature(&mut temperatures, stations[i], station_temperatures[i]);
+                }
             }
 
             IterationControl::Continue

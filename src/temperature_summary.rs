@@ -22,6 +22,7 @@ impl TemperatureSummary {
     }
 
     #[cfg_attr(feature = "profiled", inline(never))]
+    #[cfg_attr(not(feature = "profiled"), inline(always))]
     pub fn add_reading(&self, temp: i32) {
         self.min.set(self.min.get().min(temp));
         self.max.set(self.max.get().max(temp));
