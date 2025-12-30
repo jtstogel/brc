@@ -2,6 +2,7 @@
 
 use brc::memops::memchr64_unchecked;
 use brc::station_map::StationMap;
+use brc::station_map::StationMapOptions;
 use brc::station_map::StationNameKey;
 use brc::station_map::StationNameKeyView;
 use brc::station_map::new_station_map;
@@ -106,6 +107,14 @@ enum IterationControl {
     Continue,
 }
 
+#[inline(never)]
+fn drop_mmap_range(mmap: &memmap2::Mmap, start: usize, size: usize) -> BrcResult<()> {
+    unsafe {
+        mmap.unchecked_advise_range(memmap2::UncheckedAdvice::DontNeed, start, size)?;
+    }
+    Ok(())
+}
+
 #[cfg_attr(feature = "profiled", inline(never))]
 fn batched_process_lines<const N: usize, F>(file: File, mut callback: F) -> BrcResult<()>
 where
@@ -113,10 +122,21 @@ where
 {
     let mmap = unsafe { MmapOptions::new().map(&file)? };
     mmap.advise(memmap2::Advice::Sequential)?;
+    mmap.advise(memmap2::Advice::WillNeed)?;
 
     let mut cursor: usize = 0;
+
     // Handle the boundary condition of the last bytes separately.
     let mmap_boundary = mmap.len() & !1023usize;
+
+    // Every 256MiB, we madvise DONTNEED on the pages we've already processed
+    // so that resident memory stays small.
+    //
+    // This is actually a tiny bit of a performance hit,
+    // but it stops htop from reporting GiBs of memory usage.
+    const DONTNEED_SIZE: usize = 256usize << 20;
+    let mut dontneed_barrier = DONTNEED_SIZE;
+
     while cursor < mmap_boundary {
         let mut slices: [&[u8]; N] = [&[]; N];
 
@@ -127,6 +147,12 @@ where
         }
 
         callback(&slices);
+
+        // This ensures we don't keep too much data in RAM.
+        if cursor >= dontneed_barrier {
+            drop_mmap_range(&mmap, dontneed_barrier - DONTNEED_SIZE, DONTNEED_SIZE)?;
+            dontneed_barrier += DONTNEED_SIZE;
+        }
     }
 
     // Deal with boundary condition at end of mmap'd region.
@@ -156,13 +182,14 @@ fn insert_temperature(m: &mut StationMap<TemperatureSummary>, k: &str, temp: i32
 }
 
 #[cfg_attr(feature = "profiled", inline(never))]
-pub fn temperature_reading_summaries(
-    input_path: &str,
-) -> BrcResult<impl Iterator<Item = WeatherStation>> {
-    let file = File::open(input_path)
-        .map_err(|err| BrcError::new(format!("Failed to open {input_path}: {err}")))?;
+fn temperature_reading_summaries(args: &Args) -> BrcResult<impl Iterator<Item = WeatherStation>> {
+    let file = File::open(&args.input)
+        .map_err(|err| BrcError::new(format!("Failed to open {}: {err}", args.input)))?;
 
-    let mut temperatures = new_station_map::<TemperatureSummary>(12_500);
+    let mut temperatures = new_station_map::<TemperatureSummary>(&StationMapOptions {
+        request_hugepage: args.use_hugepages,
+        capacity: 12_000,
+    });
 
     const N: usize = 4;
     batched_process_lines::<N, _>(file, |lines: &[&[u8]]| {
@@ -246,6 +273,9 @@ pub fn temperature_reading_summaries(
 struct Args {
     #[arg(long, default_value = "measurements.txt")]
     input: String,
+
+    #[arg(long, default_value = "true", value_parser = clap::builder::BoolishValueParser::new())]
+    use_hugepages: bool,
 }
 
 #[cfg_attr(feature = "profiled", inline(never))]
@@ -254,7 +284,7 @@ fn run() -> BrcResult {
 
     println!(
         "{{{}}}",
-        temperature_reading_summaries(&args.input)?
+        temperature_reading_summaries(&args)?
             .map(|station| format!("{station}"))
             .join(", ")
     );
@@ -263,7 +293,7 @@ fn run() -> BrcResult {
 
 fn main() -> ExitCode {
     #[cfg(feature = "profiled")]
-    for _ in 0..4 {
+    for _ in 0..2 {
         let _ = run();
     }
 

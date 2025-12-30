@@ -3,7 +3,10 @@ use std::{
     hash::{BuildHasher, Hasher},
 };
 
-use crate::memops::memeq64_unchecked;
+use crate::{
+    mmap_allocator::{AllocatorOptions, MmapAllocator},
+    memops::memeq64_unchecked,
+};
 
 /// A wrapper type that provides comparisons optimized
 /// for strings that are <64 bytes.
@@ -162,8 +165,19 @@ impl BuildHasher for NopHasherBuilder {
     }
 }
 
-pub type StationMap<V> = hashbrown::HashMap<StationNameKey, V, NopHasherBuilder>;
+pub type StationMap<V> = hashbrown::HashMap<StationNameKey, V, NopHasherBuilder, MmapAllocator>;
 
-pub fn new_station_map<V>(capacity: usize) -> StationMap<V> {
-    StationMap::<V>::with_capacity_and_hasher(capacity, NopHasherBuilder::default())
+pub struct StationMapOptions {
+    pub request_hugepage: bool,
+    pub capacity: usize,
+}
+
+pub fn new_station_map<V>(opts: &StationMapOptions) -> StationMap<V> {
+    StationMap::<V>::with_capacity_and_hasher_in(
+        opts.capacity,
+        NopHasherBuilder::default(),
+        MmapAllocator::new(&AllocatorOptions {
+            request_hugepage: opts.request_hugepage,
+        }),
+    )
 }
