@@ -21,6 +21,7 @@ unsafe fn memchr32_unchecked<const NEEDLE: u8>(haystack: &[u8]) -> usize {
 /// This will panic if the character is not present.
 /// This will may read 64 bytes, even if the slice is less than 64 bytes.
 #[cfg_attr(feature = "profiled", inline(never))]
+#[cfg_attr(not(feature = "profiled"), inline(always))]
 pub unsafe fn memchr64_unchecked<const NEEDLE: u8>(haystack: &[u8]) -> usize {
     unsafe {
         let r = memchr32_unchecked::<NEEDLE>(haystack);

@@ -1,5 +1,6 @@
 use std::cell::Cell;
 
+#[repr(align(32))]
 pub struct TemperatureSummary {
     min: Cell<i32>,
     max: Cell<i32>,

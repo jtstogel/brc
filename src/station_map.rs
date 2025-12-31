@@ -4,8 +4,8 @@ use std::{
 };
 
 use crate::{
-    mmap_allocator::{AllocatorOptions, MmapAllocator},
     memops::memeq64_unchecked,
+    mmap_allocator::{AllocatorOptions, MmapAllocator},
 };
 
 /// A wrapper type that provides comparisons optimized
@@ -16,6 +16,7 @@ pub struct StationNameKeyView {
 }
 
 impl StationNameKeyView {
+    #[inline(always)]
     pub fn new(s: &str) -> &Self {
         // Hack to allow comparing &str against StationNameKey
         // using a custom comparator in HashMap lookups
@@ -23,6 +24,7 @@ impl StationNameKeyView {
         unsafe { &*(s as *const str as *const StationNameKeyView) }
     }
 
+    #[inline(always)]
     pub fn hash_u64(&self) -> u64 {
         hash64(self.name.as_bytes())
     }
@@ -32,6 +34,7 @@ impl StationNameKeyView {
 const SEED: u64 = 0xf1357aea2e62a9c5;
 
 #[cfg_attr(feature = "profiled", inline(never))]
+#[cfg_attr(not(feature = "profiled"), inline(always))]
 pub fn hash64(bytes: &[u8]) -> u64 {
     unsafe {
         let len = bytes.len();
@@ -57,12 +60,15 @@ pub fn hash64(bytes: &[u8]) -> u64 {
 }
 
 impl Borrow<StationNameKeyView> for StationNameKey {
+    #[inline(always)]
     fn borrow(&self) -> &StationNameKeyView {
         StationNameKeyView::new(self.name.as_str())
     }
 }
 
 impl PartialEq for StationNameKeyView {
+    #[cfg_attr(feature = "profiled", inline(never))]
+    #[cfg_attr(not(feature = "profiled"), inline(always))]
     fn eq(&self, other: &Self) -> bool {
         unsafe { memeq64_unchecked(self.name.as_bytes(), other.name.as_bytes()) }
     }
@@ -78,7 +84,7 @@ impl std::hash::Hash for StationNameKeyView {
 
 const INLINE_STRING_SIZE: usize = 56;
 
-#[repr(packed)]
+#[repr(align(64))]
 struct InlineString {
     data: [u8; INLINE_STRING_SIZE],
     len: usize,
@@ -110,6 +116,7 @@ impl StationNameKey {
         }
     }
 
+    #[inline(always)]
     pub fn view(&self) -> &StationNameKeyView {
         self.borrow()
     }
