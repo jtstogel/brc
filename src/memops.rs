@@ -4,7 +4,7 @@ use std::arch::x86_64::{
 
 /// Looks for NEEDLE in the first 64 bytes of haystack.
 #[cfg_attr(feature = "profiled", inline(never))]
-pub unsafe fn memchr32_unchecked<const NEEDLE: u8>(haystack: &[u8]) -> Option<usize> {
+unsafe fn memchr32_unchecked<const NEEDLE: u8>(haystack: &[u8]) -> usize {
     let ptr = haystack.as_ptr();
     let haystack_vec = unsafe { _mm256_loadu_si256(ptr as *const __m256i) };
 
@@ -13,11 +13,7 @@ pub unsafe fn memchr32_unchecked<const NEEDLE: u8>(haystack: &[u8]) -> Option<us
 
     let mask = unsafe { _mm256_movemask_epi8(cmp) } as u32;
 
-    if mask != 0 {
-        Some(mask.trailing_zeros() as usize)
-    } else {
-        None
-    }
+    mask.trailing_zeros() as usize
 }
 
 /// Looks for NEEDLE in the first 64 bytes of haystack.
@@ -27,10 +23,11 @@ pub unsafe fn memchr32_unchecked<const NEEDLE: u8>(haystack: &[u8]) -> Option<us
 #[cfg_attr(feature = "profiled", inline(never))]
 pub unsafe fn memchr64_unchecked<const NEEDLE: u8>(haystack: &[u8]) -> usize {
     unsafe {
-        if let Some(r) = memchr32_unchecked::<NEEDLE>(haystack) {
+        let r = memchr32_unchecked::<NEEDLE>(haystack);
+        if r < 32 {
             r
         } else {
-            32 + memchr32_unchecked::<NEEDLE>(haystack.get_unchecked(32..)).unwrap()
+            32 + memchr32_unchecked::<NEEDLE>(haystack.get_unchecked(32..))
         }
     }
 }
