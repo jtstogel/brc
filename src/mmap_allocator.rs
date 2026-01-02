@@ -48,6 +48,10 @@ unsafe impl Allocator for MmapAllocator {
         Ok(NonNull::slice_from_raw_parts(nn, size))
     }
 
+    fn allocate_zeroed(&self, layout: Layout) -> Result<NonNull<[u8]>, AllocError> {
+        self.allocate(layout)
+    }
+
     unsafe fn deallocate(&self, ptr: NonNull<u8>, layout: Layout) {
         let size = layout.size().max(1);
         unsafe { libc::munmap(ptr.as_ptr() as *mut libc::c_void, size) };

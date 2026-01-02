@@ -52,4 +52,11 @@ impl TemperatureSummary {
             count: Cell::new(1),
         }
     }
+
+    pub fn add(&self, t: &TemperatureSummary) {
+        self.max.set(self.max.get().max(t.max.get()));
+        self.min.set(self.min.get().min(t.min.get()));
+        self.count.set(self.count.get() + t.count.get());
+        self.total.set(self.total.get() + t.total.get());
+    }
 }

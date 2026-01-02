@@ -116,9 +116,14 @@ fn drop_mmap_range(mmap: &memmap2::Mmap, start: usize, size: usize) -> BrcResult
 }
 
 #[cfg_attr(feature = "profiled", inline(never))]
-fn batched_process_lines<const N: usize, F>(file: File, mut callback: F) -> BrcResult<()>
+fn batched_process_lines<const N: usize, FN, F1>(
+    file: File,
+    mut batch_callback: FN,
+    mut single_callback: F1,
+) -> BrcResult<()>
 where
-    F: FnMut(&[&[u8]]) -> IterationControl,
+    FN: FnMut(&[&[u8]]) -> IterationControl,
+    F1: FnMut(&[u8]) -> IterationControl,
 {
     let mmap = unsafe { MmapOptions::new().map(&file)? };
     mmap.advise(memmap2::Advice::Sequential)?;
@@ -127,7 +132,7 @@ where
     let mut cursor: usize = 0;
 
     // Handle the boundary condition of the last bytes separately.
-    let mmap_boundary = mmap.len() & !1023usize;
+    let mmap_boundary = mmap.len() - 256usize;
 
     // Every 256MiB, we madvise DONTNEED on the pages we've already processed
     // so that resident memory stays small.
@@ -146,7 +151,7 @@ where
             cursor += newline_idx + 1;
         }
 
-        callback(&slices);
+        batch_callback(&slices);
 
         // This ensures we don't keep too much data in RAM.
         if cursor >= dontneed_barrier {
@@ -163,9 +168,7 @@ where
         (remaining_with_safe_boundary).copy_from_slice(&remaining[..remaining.len().min(64)]);
 
         let newline_idx = unsafe { memchr64_unchecked::<b'\n'>(remaining_with_safe_boundary) };
-        let slices: [&[u8]; 1] =
-            [unsafe { remaining_with_safe_boundary.get_unchecked(..newline_idx) }];
-        callback(&slices);
+        single_callback(unsafe { remaining_with_safe_boundary.get_unchecked(..newline_idx) });
         cursor += newline_idx + 1;
     }
 
@@ -186,14 +189,19 @@ fn temperature_reading_summaries(args: &Args) -> BrcResult<impl Iterator<Item = 
     let file = File::open(&args.input)
         .map_err(|err| BrcError::new(format!("Failed to open {}: {err}", args.input)))?;
 
-    let mut temperatures = new_station_map::<TemperatureSummary>(&StationMapOptions {
+    let mut temperatures_batch = new_station_map::<TemperatureSummary>(&StationMapOptions {
         request_hugepage: args.use_hugepages,
         capacity: 12_000,
     });
+    let mut temperatures_single = new_station_map::<TemperatureSummary>(&StationMapOptions {
+        request_hugepage: args.use_hugepages,
+        capacity: 100,
+    });
 
     const N: usize = 4;
-    batched_process_lines::<N, _>(file, |lines: &[&[u8]]| {
-        if lines.len() == N {
+    batched_process_lines::<N, _, _>(
+        file,
+        |lines: &[&[u8]]| {
             let mut delim_indexes = [0usize; N];
             for i in 0..N {
                 delim_indexes[i] = unsafe { memchr64_unchecked::<b';'>(lines[i]) };
@@ -218,7 +226,7 @@ fn temperature_reading_summaries(args: &Args) -> BrcResult<impl Iterator<Item = 
 
             let mut entries: [Option<(&StationNameKey, &TemperatureSummary)>; N] = [None; N];
             for i in 0..N {
-                entries[i] = temperatures.raw_entry().from_hash(hashes[i], |k| {
+                entries[i] = temperatures_batch.raw_entry().from_hash(hashes[i], |k| {
                     k.view() == StationNameKeyView::new(stations[i])
                 });
             }
@@ -236,31 +244,43 @@ fn temperature_reading_summaries(args: &Args) -> BrcResult<impl Iterator<Item = 
 
             for i in 0..N {
                 if !found[i] {
-                    insert_temperature(&mut temperatures, stations[i], station_temperatures[i]);
+                    insert_temperature(
+                        &mut temperatures_batch,
+                        stations[i],
+                        station_temperatures[i],
+                    );
                 }
             }
 
             IterationControl::Continue
-        } else {
-            let delim_idx = unsafe { memchr64_unchecked::<b';'>(lines[0]) };
-            let temperature = parse_temperature(lines[0]);
-            let station =
-                unsafe { std::str::from_utf8_unchecked(lines[0].get_unchecked(..delim_idx)) };
+        },
+        |line| {
+            let delim_idx = unsafe { memchr64_unchecked::<b';'>(line) };
+            let temperature = parse_temperature(line);
+            let station = unsafe { std::str::from_utf8_unchecked(line.get_unchecked(..delim_idx)) };
 
-            if let Some(v) = temperatures.get_mut(StationNameKeyView::new(station)) {
+            if let Some(v) = temperatures_single.get_mut(StationNameKeyView::new(station)) {
                 v.add_reading(temperature);
             } else {
-                temperatures.insert(
+                temperatures_single.insert(
                     StationNameKey::new(station),
                     TemperatureSummary::of(temperature),
                 );
             }
 
             IterationControl::Continue
-        }
-    })?;
+        },
+    )?;
 
-    Ok(temperatures
+    for (k, v_single) in temperatures_single.into_iter() {
+        if let Some(v_batch) = temperatures_batch.get_mut(k.view()) {
+            v_batch.add(&v_single);
+        } else {
+            temperatures_batch.insert(k, v_single);
+        }
+    }
+
+    Ok(temperatures_batch
         .into_iter()
         .map(|(station, summary)| WeatherStation {
             name: station.into(),
