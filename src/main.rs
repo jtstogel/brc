@@ -1,7 +1,12 @@
+#![feature(hint_prefetch)]
+
 use brc::memops::memchr64_unchecked;
+use brc::station_map::StationMap;
+use brc::station_map::StationMapOptions;
 use brc::station_map::StationNameKey;
 use brc::station_map::StationNameKeyView;
 use brc::station_map::new_station_map;
+use cmov::Cmov;
 use memmap2::MmapOptions;
 use std::usize;
 use std::{cmp::Ordering, fmt::Display, fs::File, process::ExitCode};
@@ -64,75 +69,94 @@ fn digit_to_i32(d: u8) -> i32 {
     d.wrapping_sub(b'0') as i32
 }
 
-/// Parses a float of the form [-][d]d.d from the string.
-/// This will read up to two characters off the end of the provided slice,
-/// so only provide slices with longer buffers.
+/// Parses a float of the form ;[-][d]d.d from the end of a string.
 #[cfg_attr(feature = "profiled", inline(never))]
-fn parse_float(p: *const u8) -> i32 {
-    let neg = unsafe { *p } == b'-';
-    let idx = if neg { 1 } else { 0 };
-    // def a digit: 99.9 or 9.9
-    //              ^       ^
-    let c0 = unsafe { *p.add(idx) };
+fn parse_temperature(line: &[u8]) -> i32 {
+    let p = line.as_ptr().wrapping_add(line.len() - 1);
 
-    // maybe a digit: 99.9 or 9.9
-    //                 ^       ^
-    let c1 = unsafe { *p.add(idx + 1) };
+    // options: ;-99.9 or ;-9.9 or ;99.9 or ;9.9
+    //               ^        ^        ^       ^
+    let c0 = unsafe { *p };
 
-    // maybe a digit: 99.9 or 9.9
-    //                  ^       ^
-    let c2 = unsafe { *p.add(idx + 2) };
+    // options: ;-99.9 or ;-9.9 or ;99.9 or ;9.9
+    //             ^        ^        ^       ^
+    let c1 = unsafe { *p.sub(2) };
 
-    // maybe a digit: 99.9 or 9.9
-    //                   ^       ^
-    let c3 = unsafe { *p.add(idx + 3) };
+    // options: ;-99.9 or ;-9.9 or ;99.9 or ;9.9
+    //            ^        ^        ^       ^
+    let c2 = unsafe { *p.sub(3) };
 
-    let is_three_digits = c1 != b'.';
-    let three_digit_result = 100 * digit_to_i32(c0) + 10 * digit_to_i32(c1) + digit_to_i32(c3);
-    let two_digit_result = 10 * digit_to_i32(c0) + 1 * digit_to_i32(c2);
-    let result = if is_three_digits {
-        three_digit_result
-    } else {
-        two_digit_result
-    };
-    if neg { -result } else { result }
+    // options: ;-99.9 or ;-9.9 or ;99.9 or ;9.9
+    //           ^        ^        ^       ^
+    let c3 = unsafe { *p.sub(4) };
+
+    let is_two_digits = (c2 == b';') | (c2 == b'-');
+    let is_negative = (c3 == b'-') | (c2 == b'-');
+
+    let mut hundreds = digit_to_i32(c2);
+    hundreds.cmovnz(&0, is_two_digits as u8);
+
+    let mut result = 10 * (10 * hundreds + digit_to_i32(c1)) + digit_to_i32(c0);
+    let negative_result = -result;
+    result.cmovnz(&negative_result, is_negative as u8);
+
+    result
 }
 
 enum IterationControl {
     Continue,
 }
 
-/// Iterates over the lines of the file.
-///
-/// Requires that no line in the input is longer than 64 bytes.
-///
-/// Optionally, specify limit to only process that number of lines.
+#[inline(never)]
+fn drop_mmap_range(mmap: &memmap2::Mmap, start: usize, size: usize) -> BrcResult<()> {
+    unsafe {
+        mmap.unchecked_advise_range(memmap2::UncheckedAdvice::DontNeed, start, size)?;
+    }
+    Ok(())
+}
+
 #[cfg_attr(feature = "profiled", inline(never))]
-fn process_lines<F>(file: File, mut callback: F) -> BrcResult<()>
+fn batched_process_lines<const N: usize, FN, F1>(
+    file: File,
+    mut batch_callback: FN,
+    mut single_callback: F1,
+) -> BrcResult<()>
 where
-    F: FnMut(&[u8]) -> IterationControl,
+    FN: FnMut(&[&[u8]]) -> IterationControl,
+    F1: FnMut(&[u8]) -> IterationControl,
 {
     let mmap = unsafe { MmapOptions::new().map(&file)? };
     mmap.advise(memmap2::Advice::Sequential)?;
+    mmap.advise(memmap2::Advice::WillNeed)?;
 
     let mut cursor: usize = 0;
-    let mmap_boundary = mmap.len() & !64usize;
-    while cursor < mmap_boundary {
-        let remaining = unsafe { mmap.get_unchecked(cursor..) };
-        // TODO: This is prob inefficient. We're reading 64 bytes for the newline,
-        // and we'll probably have to re-read the same chunk multiple times.
-        // Experiment: instead read for all the newlines in a small chunk
-        // of memory (say 256 bytes), then pop through the bitmask to find
-        // the indices of newlines. That way we minimize the amount of
-        // data we're re-scanning.
-        let newline_idx = unsafe { memchr64_unchecked::<b'\n'>(remaining) };
 
-        let ctrl = callback(unsafe { remaining.get_unchecked(..newline_idx) });
-        cursor += newline_idx + 1;
-        match ctrl {
-            IterationControl::Continue => {
-                continue;
-            }
+    // Handle the boundary condition of the last bytes separately.
+    let mmap_boundary = mmap.len() - 256usize;
+
+    // Every 256MiB, we madvise DONTNEED on the pages we've already processed
+    // so that resident memory stays small.
+    //
+    // This is actually a tiny bit of a performance hit,
+    // but it stops htop from reporting GiBs of memory usage.
+    const DONTNEED_SIZE: usize = 256usize << 20;
+    let mut dontneed_barrier = DONTNEED_SIZE;
+
+    while cursor < mmap_boundary {
+        let mut slices: [&[u8]; N] = [&[]; N];
+
+        for i in 0..N {
+            let newline_idx = unsafe { memchr64_unchecked::<b'\n'>(&mmap.get_unchecked(cursor..)) };
+            slices[i] = unsafe { &mmap.get_unchecked(cursor..cursor + newline_idx) };
+            cursor += newline_idx + 1;
+        }
+
+        batch_callback(&slices);
+
+        // This ensures we don't keep too much data in RAM.
+        if cursor >= dontneed_barrier {
+            drop_mmap_range(&mmap, dontneed_barrier - DONTNEED_SIZE, DONTNEED_SIZE)?;
+            dontneed_barrier += DONTNEED_SIZE;
         }
     }
 
@@ -140,43 +164,123 @@ where
     while cursor < mmap.len() {
         let remaining = unsafe { mmap.get_unchecked(cursor..) };
         let mut data = [0; 64];
-        let remaining_with_safe_boundary = &mut data[..remaining.len()];
-        (remaining_with_safe_boundary).copy_from_slice(remaining);
+        let remaining_with_safe_boundary = &mut data[..remaining.len().min(64)];
+        (remaining_with_safe_boundary).copy_from_slice(&remaining[..remaining.len().min(64)]);
 
         let newline_idx = unsafe { memchr64_unchecked::<b'\n'>(remaining_with_safe_boundary) };
-        callback(unsafe { remaining_with_safe_boundary.get_unchecked(..newline_idx) });
+        single_callback(unsafe { remaining_with_safe_boundary.get_unchecked(..newline_idx) });
         cursor += newline_idx + 1;
     }
 
     Ok(())
 }
 
+// This is rarely called (10k times out of 1B rows),
+// so make sure it's outlined from the hot path.
+#[inline(never)]
+fn insert_temperature(m: &mut StationMap<TemperatureSummary>, k: &str, temp: i32) {
+    m.entry(StationNameKey::new(k))
+        .or_default()
+        .add_reading(temp)
+}
+
 #[cfg_attr(feature = "profiled", inline(never))]
-pub fn temperature_reading_summaries(
-    input_path: &str,
-) -> BrcResult<impl Iterator<Item = WeatherStation>> {
-    let file = File::open(input_path)
-        .map_err(|err| BrcError::new(format!("Failed to open {input_path}: {err}")))?;
+fn temperature_reading_summaries(args: &Args) -> BrcResult<impl Iterator<Item = WeatherStation>> {
+    let file = File::open(&args.input)
+        .map_err(|err| BrcError::new(format!("Failed to open {}: {err}", args.input)))?;
 
-    let mut temperatures = new_station_map::<TemperatureSummary>(20_000);
+    let mut temperatures_batch = new_station_map::<TemperatureSummary>(&StationMapOptions {
+        request_hugepage: args.use_hugepages,
+        capacity: 12_000,
+    });
+    let mut temperatures_single = new_station_map::<TemperatureSummary>(&StationMapOptions {
+        request_hugepage: args.use_hugepages,
+        capacity: 100,
+    });
 
-    process_lines(file, |line| {
-        let delim_idx = unsafe { memchr64_unchecked::<b';'>(line) };
-        let temperature = parse_float(unsafe { line.as_ptr().add(delim_idx + 1) });
-        let station = unsafe { std::str::from_utf8_unchecked(line.get_unchecked(..delim_idx)) };
+    const N: usize = 4;
+    batched_process_lines::<N, _, _>(
+        file,
+        |lines: &[&[u8]]| {
+            let mut delim_indexes = [0usize; N];
+            for i in 0..N {
+                delim_indexes[i] = unsafe { memchr64_unchecked::<b';'>(lines[i]) };
+            }
 
-        if let Some(v) = temperatures.get_mut(StationNameKeyView::new(station)) {
-            v.add_reading(temperature);
+            let mut station_temperatures = [0i32; N];
+            for i in 0..N {
+                station_temperatures[i] = parse_temperature(lines[i]);
+            }
+
+            let mut stations = [""; N];
+            for i in 0..N {
+                stations[i] = unsafe {
+                    std::str::from_utf8_unchecked(lines[i].get_unchecked(..delim_indexes[i]))
+                };
+            }
+
+            let mut hashes = [0u64; N];
+            for i in 0..N {
+                hashes[i] = StationNameKeyView::new(stations[i]).hash_u64();
+            }
+
+            let mut entries: [Option<(&StationNameKey, &TemperatureSummary)>; N] = [None; N];
+            for i in 0..N {
+                entries[i] = temperatures_batch.raw_entry().from_hash(hashes[i], |k| {
+                    k.view() == StationNameKeyView::new(stations[i])
+                });
+            }
+
+            let mut found = [false; N];
+            for i in 0..N {
+                found[i] = entries[i].is_some();
+            }
+
+            for i in 0..N {
+                if let Some(e) = entries[i] {
+                    e.1.add_reading(station_temperatures[i]);
+                }
+            }
+
+            for i in 0..N {
+                if !found[i] {
+                    insert_temperature(
+                        &mut temperatures_batch,
+                        stations[i],
+                        station_temperatures[i],
+                    );
+                }
+            }
+
+            IterationControl::Continue
+        },
+        |line| {
+            let delim_idx = unsafe { memchr64_unchecked::<b';'>(line) };
+            let temperature = parse_temperature(line);
+            let station = unsafe { std::str::from_utf8_unchecked(line.get_unchecked(..delim_idx)) };
+
+            if let Some(v) = temperatures_single.get_mut(StationNameKeyView::new(station)) {
+                v.add_reading(temperature);
+            } else {
+                temperatures_single.insert(
+                    StationNameKey::new(station),
+                    TemperatureSummary::of(temperature),
+                );
+            }
+
+            IterationControl::Continue
+        },
+    )?;
+
+    for (k, v_single) in temperatures_single.into_iter() {
+        if let Some(v_batch) = temperatures_batch.get_mut(k.view()) {
+            v_batch.add(&v_single);
         } else {
-            temperatures.insert(
-                StationNameKey::new(station),
-                TemperatureSummary::of(temperature),
-            );
+            temperatures_batch.insert(k, v_single);
         }
-        IterationControl::Continue
-    })?;
+    }
 
-    Ok(temperatures
+    Ok(temperatures_batch
         .into_iter()
         .map(|(station, summary)| WeatherStation {
             name: station.into(),
@@ -189,6 +293,9 @@ pub fn temperature_reading_summaries(
 struct Args {
     #[arg(long, default_value = "measurements.txt")]
     input: String,
+
+    #[arg(long, default_value = "true", value_parser = clap::builder::BoolishValueParser::new())]
+    use_hugepages: bool,
 }
 
 #[cfg_attr(feature = "profiled", inline(never))]
@@ -197,7 +304,7 @@ fn run() -> BrcResult {
 
     println!(
         "{{{}}}",
-        temperature_reading_summaries(&args.input)?
+        temperature_reading_summaries(&args)?
             .map(|station| format!("{station}"))
             .join(", ")
     );
@@ -205,30 +312,30 @@ fn run() -> BrcResult {
 }
 
 fn main() -> ExitCode {
-    // #[cfg(feature = "profiled")]
-    // for _ in 0..4 {
-    //     let _ = run();
-    // }
-
     #[cfg(feature = "profiled")]
-    let guard = pprof::ProfilerGuardBuilder::default()
-        .frequency(99999)
-        .blocklist(&["libc", "libgcc", "pthread", "vdso"])
-        .build()
-        .unwrap();
+    for _ in 0..2 {
+        let _ = run();
+    }
 
     let res = run();
-
-    #[cfg(feature = "profiled")]
-    if let Ok(report) = guard.report().build() {
-        let file = std::fs::File::create("brc.svg").unwrap();
-        report.flamegraph(file).unwrap();
-    };
 
     if let Err(err) = res {
         println!("{err}");
         ExitCode::FAILURE
     } else {
         ExitCode::SUCCESS
+    }
+}
+
+#[cfg(test)]
+mod test {
+    use crate::parse_temperature;
+
+    #[test]
+    fn test_parse_float() {
+        assert_eq!(parse_temperature("  ;-99.9".as_bytes()), -999);
+        assert_eq!(parse_temperature("  ;99.9".as_bytes()), 999);
+        assert_eq!(parse_temperature("  ;-9.9".as_bytes()), -99);
+        assert_eq!(parse_temperature("  ;9.9".as_bytes()), 99);
     }
 }

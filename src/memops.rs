@@ -4,23 +4,33 @@ use std::arch::x86_64::{
 
 /// Looks for NEEDLE in the first 64 bytes of haystack.
 #[cfg_attr(feature = "profiled", inline(never))]
-pub unsafe fn memchr64_unchecked<const NEEDLE: u8>(haystack: &[u8]) -> usize {
+unsafe fn memchr32_unchecked<const NEEDLE: u8>(haystack: &[u8]) -> usize {
     let ptr = haystack.as_ptr();
-    let haystack0 = unsafe { _mm256_loadu_si256(ptr as *const __m256i) };
-    let haystack1 = unsafe { _mm256_loadu_si256(ptr.add(32) as *const __m256i) };
+    let haystack_vec = unsafe { _mm256_loadu_si256(ptr as *const __m256i) };
 
     let needle_vec: __m256i = unsafe { _mm256_set1_epi8(NEEDLE as i8) };
-    let cmp0 = unsafe { _mm256_cmpeq_epi8(haystack0, needle_vec) };
-    let cmp1 = unsafe { _mm256_cmpeq_epi8(haystack1, needle_vec) };
+    let cmp = unsafe { _mm256_cmpeq_epi8(haystack_vec, needle_vec) };
 
-    let mask0 = unsafe { _mm256_movemask_epi8(cmp0) } as u32;
-    let mask1 = unsafe { _mm256_movemask_epi8(cmp1) } as u32;
+    let mask = unsafe { _mm256_movemask_epi8(cmp) } as u32;
 
-    if mask0 != 0 {
-        return mask0.trailing_zeros() as usize;
+    mask.trailing_zeros() as usize
+}
+
+/// Looks for NEEDLE in the first 64 bytes of haystack.
+///
+/// This will panic if the character is not present.
+/// This will may read 64 bytes, even if the slice is less than 64 bytes.
+#[cfg_attr(feature = "profiled", inline(never))]
+#[cfg_attr(not(feature = "profiled"), inline(always))]
+pub unsafe fn memchr64_unchecked<const NEEDLE: u8>(haystack: &[u8]) -> usize {
+    unsafe {
+        let r = memchr32_unchecked::<NEEDLE>(haystack);
+        if r < 32 {
+            r
+        } else {
+            32 + memchr32_unchecked::<NEEDLE>(haystack.get_unchecked(32..))
+        }
     }
-
-    return 32 + mask1.trailing_zeros() as usize;
 }
 
 /// Checks that up to the first 32 bytes of a and b are equal.
@@ -78,7 +88,7 @@ mod test {
     }
 
     fn safe_memchr64<const NEEDLE: u8>(haystack: &str) -> usize {
-        unsafe { memchr64_unchecked::<NEEDLE>(haystack.as_bytes()) }
+        unsafe { memchr64_unchecked::<NEEDLE>(pad64(haystack).as_bytes()) }
     }
 
     #[test]

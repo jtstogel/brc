@@ -6,3 +6,5 @@ target
 *.txt
 perf.data*
 diff.py
+*.cpp
+*.py

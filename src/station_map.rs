@@ -3,7 +3,10 @@ use std::{
     hash::{BuildHasher, Hasher},
 };
 
-use crate::memops::memeq64_unchecked;
+use crate::{
+    memops::memeq64_unchecked,
+    mmap_allocator::{AllocatorOptions, MmapAllocator},
+};
 
 /// A wrapper type that provides comparisons optimized
 /// for strings that are <64 bytes.
@@ -13,6 +16,7 @@ pub struct StationNameKeyView {
 }
 
 impl StationNameKeyView {
+    #[inline(always)]
     pub fn new(s: &str) -> &Self {
         // Hack to allow comparing &str against StationNameKey
         // using a custom comparator in HashMap lookups
@@ -20,7 +24,8 @@ impl StationNameKeyView {
         unsafe { &*(s as *const str as *const StationNameKeyView) }
     }
 
-    fn hash_u64(&self) -> u64 {
+    #[inline(always)]
+    pub fn hash_u64(&self) -> u64 {
         hash64(self.name.as_bytes())
     }
 }
@@ -29,6 +34,7 @@ impl StationNameKeyView {
 const SEED: u64 = 0xf1357aea2e62a9c5;
 
 #[cfg_attr(feature = "profiled", inline(never))]
+#[cfg_attr(not(feature = "profiled"), inline(always))]
 pub fn hash64(bytes: &[u8]) -> u64 {
     unsafe {
         let len = bytes.len();
@@ -54,16 +60,16 @@ pub fn hash64(bytes: &[u8]) -> u64 {
 }
 
 impl Borrow<StationNameKeyView> for StationNameKey {
+    #[inline(always)]
     fn borrow(&self) -> &StationNameKeyView {
         StationNameKeyView::new(self.name.as_str())
     }
 }
 
 impl PartialEq for StationNameKeyView {
+    #[cfg_attr(feature = "profiled", inline(never))]
+    #[cfg_attr(not(feature = "profiled"), inline(always))]
     fn eq(&self, other: &Self) -> bool {
-        // This saves about two seconds compared to standard string comparisons.
-        // My guess is that there are so few collisions, we're almost always looking
-        // at the entire string anyway.
         unsafe { memeq64_unchecked(self.name.as_bytes(), other.name.as_bytes()) }
     }
 }
@@ -78,7 +84,7 @@ impl std::hash::Hash for StationNameKeyView {
 
 const INLINE_STRING_SIZE: usize = 56;
 
-#[repr(packed)]
+#[repr(align(64))]
 struct InlineString {
     data: [u8; INLINE_STRING_SIZE],
     len: usize,
@@ -108,6 +114,11 @@ impl StationNameKey {
         StationNameKey {
             name: InlineString::new(name),
         }
+    }
+
+    #[inline(always)]
+    pub fn view(&self) -> &StationNameKeyView {
+        self.borrow()
     }
 }
 
@@ -161,8 +172,19 @@ impl BuildHasher for NopHasherBuilder {
     }
 }
 
-pub type StationMap<V> = std::collections::HashMap<StationNameKey, V, NopHasherBuilder>;
+pub type StationMap<V> = hashbrown::HashMap<StationNameKey, V, NopHasherBuilder, MmapAllocator>;
 
-pub fn new_station_map<V>(capacity: usize) -> StationMap<V> {
-    StationMap::<V>::with_capacity_and_hasher(capacity, NopHasherBuilder::default())
+pub struct StationMapOptions {
+    pub request_hugepage: bool,
+    pub capacity: usize,
+}
+
+pub fn new_station_map<V>(opts: &StationMapOptions) -> StationMap<V> {
+    StationMap::<V>::with_capacity_and_hasher_in(
+        opts.capacity,
+        NopHasherBuilder::default(),
+        MmapAllocator::new(&AllocatorOptions {
+            request_hugepage: opts.request_hugepage,
+        }),
+    )
 }
